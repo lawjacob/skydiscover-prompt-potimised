@@ -160,6 +160,14 @@ search:
     enable_error_retry: true
     max_error_retries: 2
 
+    # Optional APO-style mutator prompt learning (off by default)
+    meta_prompt_opt:
+      enabled: false
+      update_interval: 1
+      history_window: 8
+      min_history: 3
+      max_prompt_chars: 8000
+
     # Ablation flags (set false to disable)
     use_adaptive_search: true   # G-based intensity; false → use fixed_intensity
     use_ucb_selection: true     # UCB island selection; false → round-robin

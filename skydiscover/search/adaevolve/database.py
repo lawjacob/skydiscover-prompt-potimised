@@ -270,6 +270,12 @@ class AdaEvolveDatabase(ProgramDatabase):
         # Last sampling mode (stashed by sample() for the controller to read)
         self._last_sampling_mode: Optional[str] = None
 
+        # Optional APO-style mutable mutator-prompt state (controller-managed).
+        self.meta_prompt_opt_state: Dict[str, Any] = {
+            "current_system_prompt": None,
+            "history": [],
+        }
+
         logger.info(
             f"AdaEvolveDatabase initialized: "
             f"num_islands={self.num_islands}, "
@@ -283,6 +289,23 @@ class AdaEvolveDatabase(ProgramDatabase):
             f"paradigm_breakthrough={self.use_paradigm_breakthrough}, "
             f"multiobjective={self.is_multiobjective_enabled()}"
         )
+
+    def get_meta_prompt_opt_state(self) -> Dict[str, Any]:
+        """Return a shallow copy of APO meta prompt state."""
+        state = self.meta_prompt_opt_state or {}
+        return {
+            "current_system_prompt": state.get("current_system_prompt"),
+            "history": list(state.get("history", [])),
+        }
+
+    def set_meta_prompt_opt_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Store APO meta prompt state."""
+        if not isinstance(state, dict):
+            return
+        self.meta_prompt_opt_state = {
+            "current_system_prompt": state.get("current_system_prompt"),
+            "history": list(state.get("history", [])),
+        }
 
     def _init_archives(self, config: DatabaseConfig) -> None:
         """Initialize per-island UnifiedArchives."""
@@ -1260,6 +1283,8 @@ class AdaEvolveDatabase(ProgramDatabase):
             "adapter": self.adapter.to_dict(),
             # Island config names for dynamic spawning
             "island_config_names": self.island_config_names,
+            # APO mutable mutator-prompt state
+            "meta_prompt_opt_state": self.meta_prompt_opt_state,
         }
 
         # Island membership and genealogy depend on mode
@@ -1324,6 +1349,10 @@ class AdaEvolveDatabase(ProgramDatabase):
         self._iteration_count = metadata.get("iteration_count", 0)
         self._global_best_score = metadata.get("global_best_score", float("-inf"))
         self._diversity_strategy_type = metadata.get("diversity_strategy_type", "code")
+        self.meta_prompt_opt_state = metadata.get(
+            "meta_prompt_opt_state",
+            {"current_system_prompt": None, "history": []},
+        )
 
         # NOTE: Ablation flags are NOT restored from checkpoint.
         # The current config's ablation settings take precedence.

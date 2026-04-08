@@ -16,6 +16,7 @@ Features:
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -39,6 +40,7 @@ from skydiscover.utils.code_utils import (
     format_diff_summary,
     parse_full_rewrite,
 )
+from skydiscover.utils.metrics import get_score
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,20 @@ class AdaEvolveController(DiscoveryController):
         self.llms = LLMPool(self.config.llm.models)
         self.context_builder = AdaEvolveContextBuilder(self.config)
 
+        # Optional APO-style learning of mutator system prompt.
+        meta_cfg = getattr(db_config, "meta_prompt_opt", None)
+        self.meta_prompt_opt_enabled = bool(getattr(meta_cfg, "enabled", False))
+        self.meta_prompt_opt_update_interval = max(1, int(getattr(meta_cfg, "update_interval", 1)))
+        self.meta_prompt_opt_history_window = max(1, int(getattr(meta_cfg, "history_window", 8)))
+        self.meta_prompt_opt_min_history = max(1, int(getattr(meta_cfg, "min_history", 3)))
+        self.meta_prompt_opt_max_prompt_chars = max(
+            200, int(getattr(meta_cfg, "max_prompt_chars", 8000))
+        )
+        self._meta_prompt_history: List[Dict[str, Any]] = []
+        self._current_mutator_system_prompt: Optional[str] = None
+        if self.meta_prompt_opt_enabled:
+            self._init_meta_prompt_opt_state()
+
         # Paradigm generator (if paradigm breakthrough is enabled)
         # Note: We check database.use_paradigm_breakthrough at runtime, not this init-time flag
         # This ensures correct behavior after checkpoint load
@@ -102,7 +118,8 @@ class AdaEvolveController(DiscoveryController):
         logger.info(
             f"AdaEvolveController initialized "
             f"(language={self.config.language}, "
-            f"paradigm_breakthrough={self.database.use_paradigm_breakthrough})"
+            f"paradigm_breakthrough={self.database.use_paradigm_breakthrough}, "
+            f"meta_prompt_opt={self.meta_prompt_opt_enabled})"
         )
 
     def _load_evaluator_code(self) -> str:
@@ -110,6 +127,180 @@ class AdaEvolveController(DiscoveryController):
         from skydiscover.search.utils.discovery_utils import load_evaluator_code
 
         return load_evaluator_code(self.evaluation_file)
+
+    def _init_meta_prompt_opt_state(self) -> None:
+        """Initialize mutable mutator prompt from checkpoint state or config."""
+        state = {}
+        if hasattr(self.database, "get_meta_prompt_opt_state"):
+            state = self.database.get_meta_prompt_opt_state() or {}
+
+        saved_prompt = state.get("current_system_prompt")
+        if isinstance(saved_prompt, str) and saved_prompt.strip():
+            current_prompt = saved_prompt
+        else:
+            current_prompt = self.context_builder._get_system_message()
+
+        self._current_mutator_system_prompt = current_prompt
+        self.context_builder.set_runtime_system_message(current_prompt)
+        self._meta_prompt_history = list(state.get("history", []))
+
+        self._persist_meta_prompt_opt_state()
+        logger.info(
+            "Meta prompt optimization enabled "
+            f"(history_entries={len(self._meta_prompt_history)}, "
+            f"update_interval={self.meta_prompt_opt_update_interval})"
+        )
+
+    def _persist_meta_prompt_opt_state(self) -> None:
+        if not hasattr(self.database, "set_meta_prompt_opt_state"):
+            return
+        self.database.set_meta_prompt_opt_state(
+            {
+                "current_system_prompt": self._current_mutator_system_prompt,
+                "history": self._meta_prompt_history,
+            }
+        )
+
+    @staticmethod
+    def _extract_feedback_text(program: Program) -> str:
+        artifacts = getattr(program, "artifacts", None) or {}
+        feedback = artifacts.get("feedback")
+        if isinstance(feedback, str):
+            return feedback
+        return ""
+
+    @staticmethod
+    def _safe_excerpt(text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n... (truncated)"
+
+    def _format_meta_prompt_history(self) -> str:
+        if not self._meta_prompt_history:
+            return "(no history)"
+
+        lines: List[str] = []
+        for i, item in enumerate(self._meta_prompt_history[-self.meta_prompt_opt_history_window :], 1):
+            score = item.get("score")
+            parent_score = item.get("parent_score")
+            delta = item.get("delta")
+            lines.append(
+                f"{i}. iter={item.get('iteration')} score={score:.4f} "
+                f"parent_score={parent_score:.4f} delta={delta:+.4f}"
+                if all(isinstance(x, (int, float)) for x in [score, parent_score, delta])
+                else f"{i}. iter={item.get('iteration')} score={score} parent_score={parent_score} delta={delta}"
+            )
+            feedback = item.get("feedback")
+            if feedback:
+                lines.append(f"   feedback: {self._safe_excerpt(str(feedback), 400)}")
+        return "\n".join(lines)
+
+    async def _call_meta_optimizer(self, system_prompt: str, user_prompt: str) -> str:
+        response = await self.guide_llms.generate(
+            system_prompt,
+            [{"role": "user", "content": user_prompt}],
+            temperature=0.2,
+        )
+        return (response.text or "").strip()
+
+    @staticmethod
+    def _extract_meta_prompt_candidate(response_text: str) -> str:
+        # Prefer explicit fenced text block if present.
+        block = parse_full_rewrite(response_text, language="text")
+        if block:
+            return block.strip()
+
+        # Fallback: common labelled section.
+        match = re.search(
+            r"(?:new\s+mutator\s+system\s+prompt|rewritten\s+prompt)\s*:\s*(.*)",
+            response_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+
+        return response_text.strip()
+
+    async def _maybe_update_meta_prompt(self, iteration: int, child: Program) -> None:
+        if not self.meta_prompt_opt_enabled:
+            return
+        if (iteration + 1) % self.meta_prompt_opt_update_interval != 0:
+            return
+
+        parent_metrics = (child.metadata or {}).get("parent_metrics", {}) or {}
+        parent_score = get_score(parent_metrics) if parent_metrics else float("nan")
+        child_score = get_score(child.metrics or {}) if child.metrics else float("nan")
+        delta = child_score - parent_score if all(
+            isinstance(x, (int, float)) for x in [child_score, parent_score]
+        ) else 0.0
+        feedback = self._extract_feedback_text(child)
+
+        self._meta_prompt_history.append(
+            {
+                "iteration": iteration,
+                "child_id": child.id,
+                "parent_id": child.parent_id,
+                "score": child_score,
+                "parent_score": parent_score,
+                "delta": delta,
+                "feedback": self._safe_excerpt(feedback, 1200),
+            }
+        )
+        max_entries = max(self.meta_prompt_opt_history_window * 3, self.meta_prompt_opt_min_history)
+        self._meta_prompt_history = self._meta_prompt_history[-max_entries:]
+
+        if len(self._meta_prompt_history) < self.meta_prompt_opt_min_history:
+            self._persist_meta_prompt_opt_state()
+            return
+
+        current_prompt = self._current_mutator_system_prompt or self.context_builder._get_system_message()
+        history_text = self._format_meta_prompt_history()
+
+        gradient_user = (
+            "You are analyzing the mutator system prompt used to evolve task solutions.\n\n"
+            "Generate a concise textual gradient describing what is wrong with the CURRENT mutator system prompt.\n"
+            "Focus on failures and regressions seen in history, not generic advice.\n\n"
+            f"CURRENT MUTATOR SYSTEM PROMPT:\n{current_prompt}\n\n"
+            f"RECENT HISTORY:\n{history_text}\n\n"
+            "Output:\n"
+            "1) Top recurring failure patterns\n"
+            "2) Missing/weak instructions in current mutator prompt\n"
+            "3) Concrete edit directives for the next mutator prompt"
+        )
+        gradient_text = await self._call_meta_optimizer(
+            "You are an APO critic. Be specific and action-oriented.",
+            gradient_user,
+        )
+        gradient_text = self._safe_excerpt(gradient_text, 2500)
+
+        edit_user = (
+            "Rewrite the mutator system prompt using the textual gradient below.\n"
+            "Keep the task/evaluator interface unchanged. Optimize only mutator behavior.\n\n"
+            f"CURRENT MUTATOR SYSTEM PROMPT:\n{current_prompt}\n\n"
+            f"TEXTUAL GRADIENT:\n{gradient_text}\n\n"
+            "Return ONLY the complete new mutator system prompt in a ```text fenced block."
+        )
+        edited_text = await self._call_meta_optimizer(
+            "You edit system prompts for robust iterative optimization.",
+            edit_user,
+        )
+        candidate = self._extract_meta_prompt_candidate(edited_text)
+        if not candidate:
+            self._persist_meta_prompt_opt_state()
+            return
+        candidate = candidate[: self.meta_prompt_opt_max_prompt_chars].strip()
+        if not candidate or candidate == current_prompt:
+            self._persist_meta_prompt_opt_state()
+            return
+
+        self._current_mutator_system_prompt = candidate
+        self.context_builder.set_runtime_system_message(candidate)
+        self._persist_meta_prompt_opt_state()
+        logger.info(
+            "Meta prompt update applied "
+            f"(iter={iteration}, chars={len(candidate)}, delta={delta:+.4f})"
+        )
 
     # =========================================================================
     # JSON Logging for AdaEvolve Stats
@@ -325,6 +516,14 @@ class AdaEvolveController(DiscoveryController):
             )
         else:
             self._process_result(result, iteration, checkpoint_callback)
+            # Optional APO update of mutator system prompt (enabled by config).
+            if result.child_program_dict:
+                child = self.database.get(result.child_program_dict.get("id", ""))
+                if child:
+                    try:
+                        await self._maybe_update_meta_prompt(iteration, child)
+                    except Exception as e:
+                        logger.warning(f"Meta prompt optimization step failed: {e}")
             # Log successful iteration stats
             self._log_iteration_stats(
                 iteration=iteration,

@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -392,6 +392,16 @@ class BestOfNDatabaseConfig(DatabaseConfig):
 class AdaEvolveDatabaseConfig(DatabaseConfig):
     """AdaEvolve adaptive multi-island database config."""
 
+    @dataclass
+    class MetaPromptOptConfig:
+        """Optional APO-style optimization of the mutator system prompt."""
+
+        enabled: bool = False
+        update_interval: int = 1
+        history_window: int = 8
+        min_history: int = 3
+        max_prompt_chars: int = 8000
+
     population_size: int = 20
     num_islands: int = 2
     decay: float = 0.9
@@ -441,6 +451,9 @@ class AdaEvolveDatabaseConfig(DatabaseConfig):
     fitness_key: Optional[str] = None
     pareto_objectives: List[str] = field(default_factory=list)
     pareto_objectives_weight: float = 0.0
+
+    # APO-style meta optimization of mutator prompt
+    meta_prompt_opt: MetaPromptOptConfig = field(default_factory=MetaPromptOptConfig)
 
 
 @dataclass
@@ -658,6 +671,14 @@ class Config:
                 db_config = db_config_cls(**db_known)
                 for k, v in db_extras.items():
                     setattr(db_config, k, v)
+                # Parse known nested dataclasses for algorithm-specific configs.
+                if (
+                    isinstance(db_config, AdaEvolveDatabaseConfig)
+                    and isinstance(getattr(db_config, "meta_prompt_opt", None), dict)
+                ):
+                    db_config.meta_prompt_opt = AdaEvolveDatabaseConfig.MetaPromptOptConfig(
+                        **db_config.meta_prompt_opt
+                    )
                 search_dict["database"] = db_config
             else:
                 search_dict["database"] = db_config_cls()
@@ -707,7 +728,11 @@ class Config:
                 "type": self.search.type,
                 "num_context_programs": self.search.num_context_programs,
                 "database": {
-                    f.name: getattr(self.search.database, f.name)
+                    f.name: (
+                        asdict(getattr(self.search.database, f.name))
+                        if is_dataclass(getattr(self.search.database, f.name))
+                        else getattr(self.search.database, f.name)
+                    )
                     for f in fields(self.search.database)
                 },
             },

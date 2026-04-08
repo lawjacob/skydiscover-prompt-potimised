@@ -49,6 +49,7 @@ class DefaultContextBuilder(ContextBuilder):
         super().__init__(config)
         self.system_template_override = None
         self.user_template_override = None
+        self.runtime_system_message_override: Optional[str] = None
         self.template_manager = TemplateManager(_TEMPLATES_DIR, self.context_config.template_dir)
 
     def set_templates(
@@ -61,6 +62,10 @@ class DefaultContextBuilder(ContextBuilder):
         self.system_template_override = system_template
         self.user_template_override = user_template
         logger.info(f"Templates set: system={system_template}, user={user_template}")
+
+    def set_runtime_system_message(self, system_message: Optional[str]) -> None:
+        """Override system message at runtime without mutating config."""
+        self.runtime_system_message_override = system_message
 
     # ------------------------------------------------------------------
     # Main Prompt Builder
@@ -163,6 +168,8 @@ class DefaultContextBuilder(ContextBuilder):
 
     def _get_system_message(self) -> str:
         """Return system message from override, template, or raw config string."""
+        if self.runtime_system_message_override is not None:
+            return self.runtime_system_message_override
         if self.system_template_override:
             return self.template_manager.get_template(self.system_template_override)
         system_msg = self.context_config.system_message
