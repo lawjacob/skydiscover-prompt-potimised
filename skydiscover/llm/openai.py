@@ -33,6 +33,7 @@ REASONING_MODEL_PREFIXES = (
 )
 
 GOOGLE_AI_STUDIO_DOMAIN = "generativelanguage.googleapis.com"
+GOOGLE_VERTEX_AI_DOMAIN = "aiplatform.googleapis.com"
 
 _OPENAI_API_PREFIXES = (
     "https://api.openai.com",
@@ -65,6 +66,8 @@ class OpenAILLM(LLMInterface):
         self.api_base = model_cfg.api_base
         self.api_key = model_cfg.api_key
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
+        self._vertex_credentials = None
+        self._vertex_request = None
 
         max_retries = self.retries if self.retries is not None else 0
         is_azure = self.api_base and ".openai.azure.com" in self.api_base.lower()
@@ -108,6 +111,48 @@ class OpenAILLM(LLMInterface):
                 provider = "OpenAI"
             logger.info(f"{provider} LLM: {self.model}")
             logger._initialized_models.add(self.model)
+
+    def _is_vertex_endpoint(self) -> bool:
+        return GOOGLE_VERTEX_AI_DOMAIN in (self.api_base or "").lower()
+
+    def _refresh_vertex_access_token_if_needed(self) -> None:
+        """Refresh OAuth token for Vertex AI OpenAI-compatible endpoint.
+
+        Vertex requires an OAuth access token (not a long-lived API key). We keep
+        the OpenAI-compatible client and refresh credentials via ADC as needed.
+        """
+        if not self._is_vertex_endpoint():
+            return
+
+        # If caller explicitly provided a non-empty api_key, keep existing behavior.
+        # In cloud environments, leaving api_key empty triggers ADC-based refresh.
+        if self.api_key:
+            self.client.api_key = self.api_key
+            return
+
+        try:
+            from google.auth.transport.requests import Request
+            import google.auth
+        except Exception as exc:
+            raise RuntimeError(
+                "Vertex AI endpoint detected but google-auth is not available. "
+                "Install google-auth or provide an access token in OPENAI_API_KEY."
+            ) from exc
+
+        if self._vertex_credentials is None:
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            self._vertex_credentials = creds
+            self._vertex_request = Request()
+
+        if (not self._vertex_credentials.valid) or self._vertex_credentials.expired:
+            self._vertex_credentials.refresh(self._vertex_request)
+
+        token = getattr(self._vertex_credentials, "token", None)
+        if not token:
+            raise RuntimeError("Failed to obtain Vertex AI OAuth access token from ADC.")
+        self.client.api_key = token
 
     async def generate(
         self, system_message: str, messages: List[Dict[str, Any]], **kwargs
@@ -179,6 +224,7 @@ class OpenAILLM(LLMInterface):
     async def _call_api(self, params: Dict[str, Any]) -> str:
         loop = asyncio.get_running_loop()
         try:
+            self._refresh_vertex_access_token_if_needed()
             response = await loop.run_in_executor(
                 None, lambda: self.client.chat.completions.create(**params)
             )
@@ -215,6 +261,7 @@ class OpenAILLM(LLMInterface):
             resp_params["reasoning"] = {"effort": params["reasoning_effort"]}
 
         loop = asyncio.get_running_loop()
+        self._refresh_vertex_access_token_if_needed()
         response = await loop.run_in_executor(
             None, lambda: self.client.responses.create(**resp_params)
         )
@@ -306,4 +353,5 @@ class OpenAILLM(LLMInterface):
 
     async def _call_responses_api(self, params: Dict[str, Any]):
         loop = asyncio.get_running_loop()
+        self._refresh_vertex_access_token_if_needed()
         return await loop.run_in_executor(None, lambda: self.client.responses.create(**params))
