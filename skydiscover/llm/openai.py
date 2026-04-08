@@ -69,6 +69,15 @@ class OpenAILLM(LLMInterface):
         self._vertex_credentials = None
         self._vertex_request = None
 
+        # OpenAI client requires api_key at construction time.
+        # For Vertex+ADC mode we inject a placeholder and replace it with a
+        # freshly refreshed OAuth access token before each request.
+        if (
+            GOOGLE_VERTEX_AI_DOMAIN in (self.api_base or "").lower()
+            and (self.api_key is None or str(self.api_key).strip() == "")
+        ):
+            self.api_key = "VERTEX_ADC_PLACEHOLDER"
+
         max_retries = self.retries if self.retries is not None else 0
         is_azure = self.api_base and ".openai.azure.com" in self.api_base.lower()
 
