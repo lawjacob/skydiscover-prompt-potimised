@@ -38,6 +38,8 @@ def _resolve_eval_model() -> str:
     # so LiteLLM can use ADC (VERTEXAI_PROJECT / VERTEXAI_LOCATION) without OPENAI_API_KEY.
     if _is_vertex_openapi_base(os.environ.get("OPENAI_API_BASE")):
         return VERTEX_MODEL_FALLBACK
+    if os.environ.get("VERTEXAI_PROJECT") and os.environ.get("VERTEXAI_LOCATION"):
+        return VERTEX_MODEL_FALLBACK
 
     return DEFAULT_EVAL_MODEL
 
