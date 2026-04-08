@@ -20,6 +20,26 @@ import Stemmer
 from datasets import load_dataset
 
 dataset_size = {"full": None, "lite": 500, "tiny": 200, "test": 50}
+DEFAULT_EVAL_MODEL = "openai/gpt-5-mini"
+VERTEX_MODEL_FALLBACK = "vertex_ai/gemini-2.5-flash"
+
+
+def _is_vertex_openapi_base(api_base: str | None) -> bool:
+    return "aiplatform.googleapis.com" in (api_base or "").lower()
+
+
+def _resolve_eval_model() -> str:
+    # Explicit override takes precedence.
+    env_model = os.environ.get("SKYDISCOVER_EVAL_MODEL")
+    if env_model and env_model.strip():
+        return env_model.strip()
+
+    # If user routes OpenAI-compatible base to Vertex, default evaluator model to vertex_ai/*
+    # so LiteLLM can use ADC (VERTEXAI_PROJECT / VERTEXAI_LOCATION) without OPENAI_API_KEY.
+    if _is_vertex_openapi_base(os.environ.get("OPENAI_API_BASE")):
+        return VERTEX_MODEL_FALLBACK
+
+    return DEFAULT_EVAL_MODEL
 
 
 class Benchmark(ABC):
@@ -299,12 +319,16 @@ The following has been provided as feedback about the current function of the sy
     condense_prompt = CONDENSE_PROMPT
     for question, feedback in feedbacks:
         condense_prompt += f'\nFeedback for "{question}":\n' + feedback
-    response = completion(
-        model="openai/gpt-5-mini",
-        messages=[{"role": "user", "content": condense_prompt}],
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        api_base=os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
-    )
+    model = _resolve_eval_model()
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": condense_prompt}],
+    }
+    # vertex_ai/* uses ADC env vars; do not force OpenAI key/base there.
+    if not model.startswith("vertex_ai/"):
+        kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
+        kwargs["api_base"] = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    response = completion(**kwargs)
     return response.choices[0].message.content
 
 
@@ -318,12 +342,16 @@ def create_lm(lm_config: dict):
         "num_retries": 0,
         "provider": provider,
     }
+    if str(config.get("model", "")).startswith("vertex_ai/"):
+        # For vertex_ai provider, LiteLLM authenticates via ADC env vars.
+        config.pop("api_key", None)
+        config.pop("api_base", None)
     config = {k: v for k, v in config.items() if k != "name"}
     return dspy.LM(**config, **fixed_config)
 
 
 lm_for_optimizer = create_lm({
-    "model": "openai/gpt-5-mini",
+    "model": _resolve_eval_model(),
     "temperature": 1,
     "api_key": os.environ.get("OPENAI_API_KEY"),
     "api_base": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
