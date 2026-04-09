@@ -44,6 +44,36 @@ def _resolve_eval_model() -> str:
     return DEFAULT_EVAL_MODEL
 
 
+def _ensure_vertex_access_token() -> None:
+    """Populate OPENAI_API_KEY from ADC for Vertex-backed evaluator runs.
+
+    DSPy/LiteLLM sometimes still validates the OpenAI-style api_key path even
+    when the selected model is Vertex. Exporting a fresh ADC token here keeps
+    the evaluator path working without requiring a user-managed OpenAI key.
+    """
+    model = _resolve_eval_model()
+    if not model.startswith("vertex_ai/"):
+        return
+    if os.environ.get("OPENAI_API_KEY"):
+        return
+
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request
+    except Exception as exc:
+        raise RuntimeError(
+            "Vertex evaluator mode requires google-auth when OPENAI_API_KEY is unset."
+        ) from exc
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    credentials.refresh(Request())
+    if not getattr(credentials, "token", None):
+        raise RuntimeError("Failed to obtain ADC token for Vertex evaluator.")
+    os.environ["OPENAI_API_KEY"] = credentials.token
+
+
 class Benchmark(ABC):
     def __init__(self, dataset_mode="lite"):
         # dataset for training and validation
@@ -299,6 +329,7 @@ class HotpotSingleHop(LangProBeDSPyMetaProgram, dspy.Module):
 
 
 def generate_feedback(questions, outputs):
+    _ensure_vertex_access_token()
     feedbacks = []
     count = 0
     for question, output in zip(questions, outputs):
@@ -339,27 +370,44 @@ def create_lm(lm_config: dict):
     config["model"] = config.pop("new_model_name", config["model"])
 
     provider = None
+    is_vertex_model = str(config.get("model", "")).startswith("vertex_ai/")
+    if is_vertex_model:
+        provider = "vertex_ai"
     fixed_config = {
         "max_tokens": 16384,  # overriding the dspy defaults
         "num_retries": 0,
         "provider": provider,
     }
-    if str(config.get("model", "")).startswith("vertex_ai/"):
+    if is_vertex_model:
         # For vertex_ai provider, LiteLLM authenticates via ADC env vars.
         config.pop("api_key", None)
         config.pop("api_base", None)
     config = {k: v for k, v in config.items() if k != "name"}
     return dspy.LM(**config, **fixed_config)
 
+_configured_eval_model = None
 
-lm_for_optimizer = create_lm({
-    "model": _resolve_eval_model(),
-    "temperature": 1,
-    "api_key": os.environ.get("OPENAI_API_KEY"),
-    "api_base": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
-})
-adapter = dspy.settings.adapter  # if "qwen" not in lm_name else XMLAdapter()
-dspy.configure(lm=lm_for_optimizer, adapter=adapter)
+
+def configure_dspy_lm():
+    """Configure DSPy LM lazily so runtime env vars are honored."""
+    global _configured_eval_model
+    _ensure_vertex_access_token()
+    model = _resolve_eval_model()
+    if _configured_eval_model == model:
+        return
+
+    lm_for_optimizer = create_lm(
+        {
+            "model": model,
+            "temperature": 1,
+            "api_key": os.environ.get("OPENAI_API_KEY"),
+            "api_base": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        }
+    )
+    adapter = dspy.settings.adapter  # if "qwen" not in lm_name else XMLAdapter()
+    dspy.configure(lm=lm_for_optimizer, adapter=adapter)
+    _configured_eval_model = model
+    print(f"[hotpot_qa/evaluator] DSPy model configured: {_configured_eval_model}")
 
 
 def get_textual_context(d):
@@ -412,6 +460,7 @@ def answer_exact_match_with_feedback(example, pred, trace=None, frac=1.0):
 
 
 def evaluate(prompt_path):
+    configure_dspy_lm()
     with open(prompt_path, "r") as f:
         prompt = f.read()
 
