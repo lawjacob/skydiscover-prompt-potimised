@@ -21,7 +21,7 @@ from datasets import load_dataset
 
 dataset_size = {"full": None, "lite": 500, "tiny": 200, "test": 50}
 DEFAULT_EVAL_MODEL = "openai/gpt-5-mini"
-VERTEX_MODEL_FALLBACK = "vertex_ai/gemini-2.5-flash"
+VERTEX_MODEL_FALLBACK = "openai/gemini-2.5-flash"
 
 
 def _is_vertex_openapi_base(api_base: str | None) -> bool:
@@ -52,7 +52,7 @@ def _ensure_vertex_access_token() -> None:
     the evaluator path working without requiring a user-managed OpenAI key.
     """
     model = _resolve_eval_model()
-    if not model.startswith("vertex_ai/"):
+    if not _is_vertex_openapi_base(os.environ.get("OPENAI_API_BASE")):
         return
     if os.environ.get("OPENAI_API_KEY"):
         return
@@ -357,10 +357,8 @@ The following has been provided as feedback about the current function of the sy
         "model": model,
         "messages": [{"role": "user", "content": condense_prompt}],
     }
-    # vertex_ai/* uses ADC env vars; do not force OpenAI key/base there.
-    if not model.startswith("vertex_ai/"):
-        kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
-        kwargs["api_base"] = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
+    kwargs["api_base"] = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
     response = completion(**kwargs)
     return response.choices[0].message.content
 
@@ -369,19 +367,10 @@ def create_lm(lm_config: dict):
     config = lm_config.copy()
     config["model"] = config.pop("new_model_name", config["model"])
 
-    provider = None
-    is_vertex_model = str(config.get("model", "")).startswith("vertex_ai/")
-    if is_vertex_model:
-        provider = "vertex_ai"
     fixed_config = {
         "max_tokens": 16384,  # overriding the dspy defaults
         "num_retries": 0,
-        "provider": provider,
     }
-    if is_vertex_model:
-        # For vertex_ai provider, LiteLLM authenticates via ADC env vars.
-        config.pop("api_key", None)
-        config.pop("api_base", None)
     config = {k: v for k, v in config.items() if k != "name"}
     return dspy.LM(**config, **fixed_config)
 
