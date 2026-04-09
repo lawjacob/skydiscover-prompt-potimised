@@ -21,7 +21,7 @@ from datasets import load_dataset
 
 dataset_size = {"full": None, "lite": 500, "tiny": 200, "test": 50}
 DEFAULT_EVAL_MODEL = "openai/gpt-5-mini"
-VERTEX_MODEL_FALLBACK = "openai/gemini-2.5-flash"
+VERTEX_MODEL_FALLBACK = "openai/google/gemini-2.5-flash"
 
 
 def _is_vertex_openapi_base(api_base: str | None) -> bool:

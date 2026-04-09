@@ -34,6 +34,7 @@ REASONING_MODEL_PREFIXES = (
 
 GOOGLE_AI_STUDIO_DOMAIN = "generativelanguage.googleapis.com"
 GOOGLE_VERTEX_AI_DOMAIN = "aiplatform.googleapis.com"
+VERTEX_ADC_PLACEHOLDER = "VERTEX_ADC_PLACEHOLDER"
 
 _OPENAI_API_PREFIXES = (
     "https://api.openai.com",
@@ -76,7 +77,7 @@ class OpenAILLM(LLMInterface):
             GOOGLE_VERTEX_AI_DOMAIN in (self.api_base or "").lower()
             and (self.api_key is None or str(self.api_key).strip() == "")
         ):
-            self.api_key = "VERTEX_ADC_PLACEHOLDER"
+            self.api_key = VERTEX_ADC_PLACEHOLDER
 
         max_retries = self.retries if self.retries is not None else 0
         is_azure = self.api_base and ".openai.azure.com" in self.api_base.lower()
@@ -133,9 +134,10 @@ class OpenAILLM(LLMInterface):
         if not self._is_vertex_endpoint():
             return
 
-        # If caller explicitly provided a non-empty api_key, keep existing behavior.
-        # In cloud environments, leaving api_key empty triggers ADC-based refresh.
-        if self.api_key:
+        # If caller explicitly provided a non-placeholder api_key, keep existing behavior.
+        # In cloud environments, leaving api_key empty (or using the bootstrap placeholder)
+        # triggers ADC-based refresh.
+        if self.api_key and self.api_key != VERTEX_ADC_PLACEHOLDER:
             self.client.api_key = self.api_key
             return
 
