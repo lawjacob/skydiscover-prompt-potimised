@@ -71,6 +71,7 @@ prompt-optimization = [
     "datasets>=4.5.0",
     "diskcache>=5.6.3",
     "ujson>=5.11.0",
+    "google-auth>=2.38.0",
 ]
 
 [tool.uv]
